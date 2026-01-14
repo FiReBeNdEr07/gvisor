@@ -25,6 +25,8 @@ import (
 )
 
 // NullClock implements a clock that never advances.
+//
+// +stateify savable
 type NullClock struct{}
 
 var _ tcpip.Clock = (*NullClock)(nil)
@@ -92,8 +94,9 @@ func (n *notificationChannels) wait() {
 	}
 }
 
+// +stateify savable
 type manualClockMutex struct {
-	sync.RWMutex
+	sync.RWMutex `state:"nosave"`
 
 	// now is the current (fake) time of the clock.
 	now time.Time
@@ -102,7 +105,7 @@ type manualClockMutex struct {
 	times timeHeap
 
 	// timers holds the timers scheduled for each time.
-	timers map[time.Time]map[*manualTimer]struct{}
+	timers map[time.Time]map[*manualTimer]struct{} `state:"nosave"`
 }
 
 // ManualClock implements tcpip.Clock and only advances manually with Advance

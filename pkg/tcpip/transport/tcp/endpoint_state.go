@@ -33,7 +33,7 @@ var logDisconnectOnce sync.Once
 
 func logDisconnect() {
 	logDisconnectOnce.Do(func() {
-		log.Infof("One or more TCP connections terminated during save")
+		log.Infof("One or more TCP connections terminated during restore")
 	})
 }
 
@@ -49,13 +49,7 @@ func (e *Endpoint) beforeSave() {
 	switch {
 	case epState == StateInitial || epState == StateBound:
 	case epState.connected() || epState.handshake():
-		if !e.route.HasSaveRestoreCapability() {
-			logDisconnect()
-			e.resetConnectionLocked(&tcpip.ErrConnectionAborted{})
-			e.mu.Unlock()
-			e.Close()
-			e.mu.Lock()
-		}
+		e.restoreConn = e.route.HasSaveRestoreCapability()
 		fallthrough
 	case epState == StateListen:
 		// Nothing to do.
@@ -133,6 +127,28 @@ func (e *Endpoint) afterLoad(ctx context.Context) {
 	}
 }
 
+func (e *Endpoint) releaseOldRoute() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.route != nil {
+		e.route.Release()
+		e.route = nil
+	}
+}
+
+func (e *Endpoint) closeAtRestore() {
+	e.mu.Lock()
+	logDisconnect()
+	e.resetConnectionLocked(&tcpip.ErrConnectionAborted{})
+	// Update the origEndpointState to error as it will be used during restore.
+	e.origEndpointState = uint32(StateError)
+	e.mu.Unlock()
+	e.Close()
+	e.stack.CompleteTransportEndpointCleanup(e)
+	tcpip.DeleteDanglingEndpoint(e)
+}
+
 // Restore implements tcpip.RestoredEndpoint.Restore.
 func (e *Endpoint) Restore(s *stack.Stack) {
 	if !e.EndpointState().closed() {
@@ -154,6 +170,7 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 
 	e.mu.Lock()
 	id := e.ID
+	restoreConn := e.restoreConn
 	e.mu.Unlock()
 
 	bind := func() {
@@ -186,6 +203,13 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 	epState := EndpointState(e.origEndpointState)
 	switch {
 	case epState.connected():
+		if !restoreConn {
+			e.closeAtRestore()
+			connectedLoading.Done()
+			return
+		}
+		e.releaseOldRoute()
+
 		bind()
 		if e.connectingAddress.BitLen() == 0 {
 			e.connectingAddress = e.TransportEndpointInfo.ID.RemoteAddress
@@ -254,6 +278,7 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 				tcpip.AsyncLoading.Done()
 			}()
 		} else {
+			e.releaseOldRoute()
 			go func() {
 				connectedLoading.Wait()
 				e.LockUser()
@@ -269,6 +294,7 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 			}()
 		}
 	case epState == StateConnecting:
+		e.releaseOldRoute()
 		// Initial SYN hasn't been sent yet so initiate a connect.
 		tcpip.AsyncLoading.Add(1)
 		go func() {
@@ -288,6 +314,16 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 		go func() {
 			connectedLoading.Wait()
 			listenLoading.Wait()
+
+			// Handshake phase.
+			if !restoreConn {
+				e.closeAtRestore()
+				connectingLoading.Done()
+				tcpip.AsyncLoading.Done()
+				return
+			}
+			e.releaseOldRoute()
+
 			// Initial SYN has been sent/received so we should bind the
 			// ports start the retransmit timer for the SYNs and let it
 			// naturally complete the connection.
@@ -314,6 +350,7 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 			e.mu.Unlock()
 		}()
 	case epState == StateBound:
+		e.releaseOldRoute()
 		tcpip.AsyncLoading.Add(1)
 		go func() {
 			connectedLoading.Wait()
